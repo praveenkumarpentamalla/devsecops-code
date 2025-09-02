@@ -1,0 +1,254 @@
+name: Django DevSecOps CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-test-scan:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: django
+          POSTGRES_PASSWORD: django
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U django -d testdb"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      # Checkout repo
+      - uses: actions/checkout@v4
+        with:
+          # Fetch all history for GitLeaks to work properly
+          fetch-depth: 0
+
+      # Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      # Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---- DATA LEAKAGE DETECTION ----
+      # GitGuardian for secrets detection
+      - name: GitGuardian Scan
+        uses: GitGuardian/gg-shield-action@master
+        env:
+          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
+
+      # Gitleaks for secrets detection
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          redact: true  # Redact secrets from logs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # TruffleHog for high-entropy secrets detection
+      - name: TruffleHog Scan
+        run: |
+          docker run --rm -v "$(pwd)":/workdir trufflesecurity/trufflehog:latest \
+            github --repo github.com/${{ github.repository }} --only-verified --no-update
+        continue-on-error: true
+
+      # Detect-secrets for proactive prevention
+      - name: Detect-secrets Scan
+        run: |
+          pip install detect-secrets
+          if [ -f .secrets.baseline ]; then
+            echo "Using existing secrets baseline"
+            detect-secrets scan --baseline .secrets.baseline
+          else
+            echo "No baseline found, creating one..."
+            detect-secrets scan > .secrets.baseline
+            echo "Please audit the baseline file and commit it to your repository:"
+            echo "File created: .secrets.baseline"
+            echo "To audit: detect-secrets audit .secrets.baseline"
+          fi
+        continue-on-error: true
+
+      # Run Django tests
+      - name: Run Django tests
+        env:
+          DATABASE_URL: postgres://django:django@localhost:5432/testdb
+          SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+        run: |
+          python manage.py migrate --noinput
+          python manage.py test
+
+      # ---- Security Scans ----
+      # SonarCloud (SAST + Code quality)
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        with:
+          projectBaseDir: .
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Snyk (SCA)
+      - name: Snyk Security Scan
+        uses: snyk/actions/python@master
+        with:
+          command: test
+          args: --file=requirements.txt --package-manager=pip
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      # Trivy (Container scan)
+      - name: Build Docker image
+        run: docker build -t rxcapital:latest .
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: rxcapital:latest
+          format: table
+          exit-code: 0
+          severity: HIGH,CRITICAL
+
+      # ---- OWASP ZAP (DAST - Baseline scan) ----
+      - name: Start Django server
+        run: |
+          # Start Django server in background with nohup and redirect output
+          nohup python manage.py runserver 0.0.0.0:8035 > django-server.log 2>&1 &
+          echo $! > django-server.pid
+          sleep 10  # initial sleep
+
+      - name: Wait for Django server
+        run: |
+          for i in {1..15}; do
+            if curl -f http://localhost:8035/ > /dev/null 2>&1; then
+              echo "✅ Server is up and running!"
+              curl -I http://localhost:8035/
+              break
+            fi
+            echo "⏳ Waiting for server to start... (attempt $i/15)"
+            sleep 3
+          done
+          
+          # Check if server process is running
+          if ps -p $(cat django-server.pid) > /dev/null 2>&1; then
+            echo "✅ Django server process is running"
+          else
+            echo "❌ Django server process not found"
+            echo "=== Server logs ==="
+            cat django-server.log || echo "No server logs found"
+          fi
+
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: 'http://localhost:8035'
+          cmd_options: '-a -J report_json.json -w report_md.md -r report_html.html'
+          allow_issue_writing: false
+        continue-on-error: true
+        timeout-minutes: 10  # Increase timeout if needed
+
+      - name: Check and debug ZAP reports
+        run: |
+          echo "=== Checking report files ==="
+          ls -la *.json *.md *.html 2>/dev/null || echo "No report files found"
+          
+          echo "=== File sizes ==="
+          for file in report_json.json report_md.md report_html.html; do
+            if [ -f "$file" ]; then
+              echo "$file: $(wc -c < "$file") bytes"
+              # Show first few lines if file exists but might be empty
+              if [ $(wc -c < "$file") -gt 0 ]; then
+                echo "First 3 lines of $file:"
+                head -3 "$file"
+              else
+                echo "$file is empty"
+              fi
+            else
+              echo "$file does not exist"
+            fi
+            echo "---"
+          done
+          
+          echo "=== Checking for ZAP output files ==="
+          find . -name "*.json" -o -name "*.md" -o -name "*.html" -o -name "*.out" | head -10
+
+      - name: Debug Django server status during scan
+        run: |
+          echo "=== Checking if Django server is still running ==="
+          if [ -f django-server.pid ] && ps -p $(cat django-server.pid) > /dev/null 2>&1; then
+            echo "✅ Django server still running"
+          else
+            echo "❌ Django server not running"
+            echo "=== Server logs ==="
+            cat django-server.log 2>/dev/null || echo "No server logs available"
+          fi
+          
+          echo "=== Current processes on port 8035 ==="
+          netstat -tulpn 2>/dev/null | grep :8035 || ss -tulpn 2>/dev/null | grep :8035 || echo "No process found on port 8035"
+
+      - name: Upload ZAP Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-reports
+          path: |
+            report_json.json
+            report_md.md
+            report_html.html
+          if-no-files-found: ignore
+
+      - name: Upload Django server logs for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-debug-logs
+          path: |
+            django-server.log
+            django-server.pid
+          if-no-files-found: ignore
+
+      - name: Display ZAP scan summary
+        if: always()
+        run: |
+          echo "=== ZAP SCAN SUMMARY ==="
+          
+          if [ -f report_md.md ] && [ $(wc -c < report_md.md) -gt 0 ]; then
+            echo "📊 Markdown Report Content:"
+            echo "=========================="
+            cat report_md.md
+          elif [ -f report_json.json ] && [ $(wc -c < report_json.json) -gt 0 ]; then
+            echo "📋 JSON Report Summary:"
+            echo "======================"
+            jq -r '"Scan version: \(.["@version"])\nTotal sites: \(.site | length)\nTotal alerts: \([.site[].alerts[]] | length)"' report_json.json 2>/dev/null || echo "Could not parse JSON report"
+          else
+            echo "❌ No ZAP reports found or reports are empty"
+            echo "This could indicate:"
+            echo "1. Django server wasn't running during scan"
+            echo "2. ZAP couldn't connect to localhost:8035"
+            echo "3. ZAP scan failed completely"
+            echo "4. Permission issues with file writing"
+          fi
+
+      # Cleanup server process
+      - name: Stop Django server
+        if: always()
+        run: |
+          if [ -f django-server.pid ]; then
+            echo "Stopping Django server..."
+            kill $(cat django-server.pid) 2>/dev/null || true
+            rm -f django-server.pid
+          fi
