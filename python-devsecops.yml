@@ -1,0 +1,137 @@
+name: Django DevSecOps CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-test-scan:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: django
+          POSTGRES_PASSWORD: django
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U django -d testdb"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      # Checkout repo
+      - uses: actions/checkout@v4
+
+      # Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      # Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Run Django tests
+      - name: Run Django tests
+        env:
+          DATABASE_URL: postgres://django:django@localhost:5432/testdb
+        run: |
+          python manage.py migrate --noinput
+          python manage.py test
+
+      # ---- Security Scans ----
+      # SonarCloud (SAST + Code quality)
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        with:
+          projectBaseDir: .
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Snyk (SCA)
+      - name: Snyk Security Scan
+        uses: snyk/actions/python@master
+        with:
+          command: test
+          args: --file=requirements.txt --package-manager=pip
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      # Trivy (Container scan)
+      - name: Build Docker image
+        run: docker build -t rxcapital:latest .
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: rxcapital:latest
+          format: table
+          exit-code: 0
+          severity: HIGH,CRITICAL
+
+      # ---- OWASP ZAP (DAST - Baseline scan) ----
+      - name: Start Django server
+        run: |
+          nohup python manage.py runserver 0.0.0.0:8035 &
+          sleep 10  # initial sleep
+
+      - name: Wait for Django server
+        run: |
+          for i in {1..10}; do
+            if curl -f http://localhost:8035/ > /dev/null 2>&1; then
+              echo "Server is up and running!"
+              break
+            fi
+            echo "Waiting for server to start... (attempt $i/10)"
+            sleep 5
+          done
+
+      - name: Ensure report files are writable
+        run: touch report_json.json report_md.md report_html.html
+
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: 'http://localhost:8035'
+          cmd_options: '-a -J report_json.json -w report_md.md -r report_html.html'
+          allow_issue_writing: false
+        continue-on-error: true
+
+      - name: Verify ZAP reports were created
+        run: |
+          ls -la report_*
+          echo "JSON report size: $(wc -c < report_json.json) bytes"
+          echo "MD report size: $(wc -c < report_md.md) bytes"
+          echo "HTML report size: $(wc -c < report_html.html) bytes"
+
+      - name: Upload ZAP Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-reports
+          path: |
+            report_json.json
+            report_md.md
+            report_html.html
+          if-no-files-found: warn
+
+      # Additional step to display ZAP scan summary
+      - name: Display ZAP scan summary
+        run: |
+          if [ -f report_md.md ]; then
+            echo "=== ZAP SCAN SUMMARY ==="
+            grep -E "(PASS|WARN|FAIL)" report_md.md | head -20
+          else
+            echo "ZAP report not found"
+          fi
